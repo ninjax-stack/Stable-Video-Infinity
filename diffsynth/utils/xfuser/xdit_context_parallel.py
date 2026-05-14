@@ -8,16 +8,26 @@ from xfuser.core.long_ctx_attention import xFuserLongContextAttention
 
 
 def initialize_usp():
+    #changed by daniel to support multi gpu
+    import os
+    local_rank = int(os.environ.get("LOCAL_RANK", -1))
+
+    if local_rank != -1:
+        print(f"current local_rank {local_rank}")
+        torch.cuda.set_device(local_rank)
+    else:
+        local_rank=0
+    #end change
     import torch.distributed as dist
     from xfuser.core.distributed import initialize_model_parallel, init_distributed_environment
     dist.init_process_group(backend="nccl", init_method="env://")
-    init_distributed_environment(rank=dist.get_rank(), world_size=dist.get_world_size())
+    init_distributed_environment(rank=dist.get_rank(), world_size=dist.get_world_size(),local_rank=local_rank)
     initialize_model_parallel(
         sequence_parallel_degree=dist.get_world_size(),
         ring_degree=1,
         ulysses_degree=dist.get_world_size(),
     )
-    torch.cuda.set_device(dist.get_rank())
+    # torch.cuda.set_device(dist.get_rank())
 
 
 def sinusoidal_embedding_1d(dim, position):
