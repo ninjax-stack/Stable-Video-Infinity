@@ -278,9 +278,128 @@ class BasePipeline(torch.nn.Module):
         
     
     def download_and_load_models(self, model_configs: list[ModelConfig] = [], vram_limit: float = None):
+        #changed by daniel to load custom model
+        from ..models.model_loader import ModelPool
+        import os
+
+        # Define the custom converter to handle various prefixes
+        def universal_wan_converter(state_dict):
+            new_state_dict = {}
+            for k in state_dict:
+                v = state_dict[k]
+                new_key = k
+                if k.startswith("model.diffusion_model."):
+                    new_key = k[len("model.diffusion_model."):]
+                elif k.startswith("model."):
+                    new_key = k[len("model."):]
+                elif k.startswith("diffusion_pytorch_model."):
+                    new_key = k[len("diffusion_pytorch_model."):]
+                
+                # T5 mapping for HF models
+                if "encoder.block." in new_key:
+                    new_key = new_key.replace("encoder.block.", "blocks.")
+                    new_key = new_key.replace(".layer.0.SelfAttention.", ".attn.")
+                    new_key = new_key.replace(".layer.0.layer_norm.", ".norm1.")
+                    new_key = new_key.replace(".layer.1.DenseReluDense.wi_0.", ".ffn.gate.0.")
+                    new_key = new_key.replace(".layer.1.DenseReluDense.wi_1.", ".ffn.fc1.")
+                    new_key = new_key.replace(".layer.1.DenseReluDense.wo.", ".ffn.fc2.")
+                    new_key = new_key.replace(".layer.1.layer_norm.", ".norm2.")
+                    new_key = new_key.replace(".attn.relative_attention_bias.", ".pos_embedding.embedding.")
+                elif new_key == "encoder.final_layer_norm.weight":
+                    new_key = "norm.weight"
+                elif new_key in ["shared.weight", "encoder.embed_tokens.weight"]:
+                    new_key = "token_embedding.weight"
+                
+                new_state_dict[new_key] = v
+            return new_state_dict
+
+        # Monkey patch ModelPool.import_model_class to support "UniversalWanConverter"
+        original_import = ModelPool.import_model_class
+        def patched_import_model_class(self_pool, model_class_path):
+            if model_class_path == "UniversalWanConverter":
+                return universal_wan_converter
+            return original_import(self_pool, model_class_path)
+        ModelPool.import_model_class = patched_import_model_class
+
+        # Monkey patch ModelPool.auto_load_model to handle unknown hashes for T5/DiT
+        original_auto_load = ModelPool.auto_load_model
+        def patched_auto_load_model(self_pool, path, vram_config=None, vram_limit=None, clear_parameters=False):
+            try:
+                return original_auto_load(self_pool, path, vram_config, vram_limit, clear_parameters)
+            except ValueError as e:
+                filename = path[0] if isinstance(path, list) else path
+                filename = os.path.basename(filename).lower()
+                
+                # Try to guess model type from filename
+                model_name = None
+                if "umt5" in filename or "t5" in filename:
+                    model_name = "wan_video_text_encoder"
+                elif "vae" in filename:
+                    model_name = "wan_video_vae"
+                elif "clip" in filename:
+                    model_name = "wan_video_image_encoder"
+                elif "custom-wan2" in filename or "diffusion_pytorch_model" in filename:
+                    model_name = "wan_video_dit"
+                
+                if model_name:
+                    print(f"Hash check failed for {filename}, but guessing model type: {model_name}. Forcing load.")
+                    # Find a matching config as template
+                    template_config = None
+                    from ..configs import MODEL_CONFIGS
+                    for config in reversed(MODEL_CONFIGS):
+                        if config.get("model_name") == model_name:
+                            template_config = config
+                            break
+                    if template_config:
+                        # Use load_model_file with the template config but our path
+                        model = self_pool.load_model_file(template_config, path, vram_config or self_pool.default_vram_config(), vram_limit=vram_limit)
+                        if clear_parameters: self_pool.clear_parameters(model)
+                        self_pool.model.append(model)
+                        self_pool.model_name.append(model_name)
+                        self_pool.model_path.append(path)
+                        return
+                raise e
+        ModelPool.auto_load_model = patched_auto_load_model
+
+        # Configuration for the custom Wan 2.2 I2V models
+        # (Based on inspect: 40 layers, dim 5120, ffn_dim 13824, in_dim 36),add here for new models
+        wan_series = [
+            {
+                "model_hash": "ce0d6f9edef505c078665c29046eb82e",
+                "model_name": "wan_video_dit",
+                "model_class": "diffsynth.models.wan_video_dit.WanModel",
+                "extra_kwargs": {'has_image_input': False, 'patch_size': [1, 2, 2], 'in_dim': 36, 'dim': 5120, 'ffn_dim': 13824, 'freq_dim': 256, 'text_dim': 4096, 'out_dim': 16, 'num_heads': 40, 'num_layers': 40, 'eps': 1e-06, 'require_clip_embedding': False,},
+                "state_dict_converter": "UniversalWanConverter"
+            },
+            {
+                "model_hash": "5b013604280dd715f8457c6ed6d6a626",
+                "model_name": "wan_video_dit",
+                "model_class": "diffsynth.models.wan_video_dit.WanModel",
+                "extra_kwargs": {'has_image_input': False, 'patch_size': [1, 2, 2], 'in_dim': 36, 'dim': 5120, 'ffn_dim': 13824, 'freq_dim': 256, 'text_dim': 4096, 'out_dim': 16, 'num_heads': 40, 'num_layers': 40, 'eps': 1e-06, 'require_clip_embedding': False,},
+                "state_dict_converter": "UniversalWanConverter"
+            },
+             {
+                "model_hash": "1663aabb1c900fdd416fe4bf56cd0a1b",
+                "model_name": "wan_video_text_encoder",
+                "model_class": "diffsynth.models.wan_video_text_encoder.WanTextEncoder",
+                "state_dict_converter": "UniversalWanConverter"
+            }
+            
+        ]
+        from ..configs import MODEL_CONFIGS
+        # Update existing configs to use our universal converter if they match Wan models
+        for config in MODEL_CONFIGS:
+            if config.get("model_name") in ["wan_video_dit", "wan_video_vae", "wan_video_text_encoder", "wan_video_image_encoder"]:
+                if "state_dict_converter" not in config:
+                    config["state_dict_converter"] = "UniversalWanConverter"
+        
+        MODEL_CONFIGS += wan_series
         model_pool = ModelPool()
         for model_config in model_configs:
-            model_config.download_if_necessary()
+            # model_config.download_if_necessary()
+            import glob,os
+            model_config.reset_local_model_path()
+            model_config.path = glob.glob(os.path.join(model_config.local_model_path, model_config.model_id, model_config.origin_file_pattern))
             vram_config = model_config.vram_config()
             vram_config["computation_dtype"] = vram_config["computation_dtype"] or self.torch_dtype
             vram_config["computation_device"] = vram_config["computation_device"] or self.device
@@ -290,6 +409,7 @@ class BasePipeline(torch.nn.Module):
                 vram_limit=vram_limit,
                 clear_parameters=model_config.clear_parameters,
             )
+        #end change
         return model_pool
     
     
