@@ -338,7 +338,16 @@ class BasePipeline(torch.nn.Module):
                     model_name = "wan_video_vae"
                 elif "clip" in filename:
                     model_name = "wan_video_image_encoder"
-                elif "custom-wan2" in filename or "diffusion_pytorch_model" in filename:
+                elif (
+                    "custom-wan2" in filename
+                    or "diffusion_pytorch_model" in filename
+                    or filename.endswith(".safetensors")
+                ):
+                    # Catch-all: any unrecognized safetensors (umt5/vae/clip
+                    # already routed above) is most likely a Wan DiT variant —
+                    # custom checkpoints, A14B fine-tunes, repacks. Uses the
+                    # most recent wan_video_dit template (A14B geometry); non-
+                    # A14B-shaped files fail at load_state_dict, which is correct.
                     model_name = "wan_video_dit"
                 
                 if model_name:
